@@ -1,0 +1,5 @@
+/.chroma
+/.env
+/db.sqlite3
+/media
+/venv
