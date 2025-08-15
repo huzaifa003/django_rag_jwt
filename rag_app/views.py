@@ -77,25 +77,7 @@ class ConversationListCreateView(APIView):
         c = Conversation.objects.create(owner=request.user, title=title)
         return Response(ConversationSerializer(c).data, status=201)
     
-    def delete(self, request, convo_id):
-        try:
-            convo = Conversation.objects.get(pk=convo_id, owner=request.user)
-        except Conversation.DoesNotExist:
-            return Response(status=404)
-        # delete all messages and sources
-        MessageSource.objects.filter(message__conversation=convo).delete()
-        Message.objects.filter(conversation=convo).delete()
-        convo.delete()
-        return Response(status=204)
     
-    def put(self, request, convo_id):
-        try:
-            convo = Conversation.objects.get(pk=convo_id, owner=request.user)
-        except Conversation.DoesNotExist:
-            return Response(status=404)
-        convo.title = request.data.get('title','')
-        convo.save()
-        return Response(ConversationSerializer(convo).data)
 
 
 class MessageCreateView(APIView):
@@ -170,3 +152,23 @@ class ConversationDetailView(APIView):
             'conversation': ConversationSerializer(convo).data,
             'messages': MessageSerializer(msgs, many=True).data,
         })
+        
+    def delete(self, request, convo_id):
+        try:
+            convo = Conversation.objects.get(pk=convo_id, owner=request.user)
+        except Conversation.DoesNotExist:
+            return Response(status=404)
+        # delete all messages and sources
+        MessageSource.objects.filter(message__conversation=convo).delete()
+        Message.objects.filter(conversation=convo).delete()
+        convo.delete()
+        return Response(status=204)
+    
+    def put(self, request, convo_id):
+        try:
+            convo = Conversation.objects.get(pk=convo_id, owner=request.user)
+        except Conversation.DoesNotExist:
+            return Response(status=404)
+        convo.title = request.data.get('title','')
+        convo.save()
+        return Response(ConversationSerializer(convo).data)
