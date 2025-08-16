@@ -1,21 +1,105 @@
 import os
 from django.conf import settings
-from django.contrib.auth.models import User
 from rest_framework import generics, permissions, status
 from rest_framework.response import Response
 from rest_framework.views import APIView
 from rest_framework.parsers import MultiPartParser, FormParser
-from .models import Document, Conversation, Message, MessageSource
-from .serializers import RegisterSerializer, DocumentSerializer, ConversationSerializer, MessageSerializer
+from rest_framework_simplejwt.views import TokenObtainPairView
+from .models import CustomUser, Document, Conversation, Message, MessageSource
+from .serializers import (
+    RegisterSerializer, CustomTokenObtainPairSerializer, DocumentSerializer, ConversationSerializer, MessageSerializer,
+    PasswordResetRequestSerializer, PasswordResetConfirmSerializer, ChangePasswordSerializer,
+    UserProfileSerializer, UserProfileUpdateSerializer, ProfilePictureSerializer
+)
 from .extract import extract_pdf_pages_as_images
 from .openai_helpers import vision_extract, synthesize_answer
 from .textutils import split_for_embedding
 from .store import ChromaStore
+from .email_service import (
+    create_verification_token, send_verification_email, verify_email_token,
+    create_password_reset_token, send_password_reset_email, verify_password_reset_token, use_password_reset_token
+)
+
+class CustomTokenObtainPairView(TokenObtainPairView):
+    serializer_class = CustomTokenObtainPairSerializer
 
 class RegisterView(generics.CreateAPIView):
-    queryset = User.objects.all()
+    queryset = CustomUser.objects.all()
     serializer_class = RegisterSerializer
     permission_classes = [permissions.AllowAny]
+    
+    def perform_create(self, serializer):
+        user = serializer.save()
+        # Create and send verification email
+        verification_token = create_verification_token(user)
+        send_verification_email(user, verification_token)
+
+class SendVerificationEmailView(APIView):
+    permission_classes = [permissions.AllowAny]
+    
+    def post(self, request):
+        email = request.data.get('email')
+        if not email:
+            return Response({'detail': 'Email is required'}, status=status.HTTP_400_BAD_REQUEST)
+        
+        try:
+            user = CustomUser.objects.get(email=email)
+            
+            if user.email_verified:
+                return Response({'detail': 'Email is already verified'}, status=status.HTTP_400_BAD_REQUEST)
+            
+            # Create and send new verification email
+            verification_token = create_verification_token(user)
+            email_sent = send_verification_email(user, verification_token)
+            
+            if email_sent:
+                return Response({
+                    'detail': 'Verification email sent successfully',
+                    'message': 'Please check your email and click the verification link.'
+                }, status=status.HTTP_200_OK)
+            else:
+                return Response({
+                    'detail': 'Failed to send verification email'
+                }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+                
+        except CustomUser.DoesNotExist:
+            return Response({'detail': 'User not found'}, status=status.HTTP_404_NOT_FOUND)
+
+class VerifyEmailView(APIView):
+    permission_classes = [permissions.AllowAny]
+    
+    def post(self, request):
+        token = request.data.get('token')
+        if not token:
+            return Response({'detail': 'Token is required'}, status=status.HTTP_400_BAD_REQUEST)
+        
+        success, message = verify_email_token(token)
+        
+        if success:
+            return Response({
+                'detail': message,
+                'email_verified': True
+            }, status=status.HTTP_200_OK)
+        else:
+            return Response({
+                'detail': message,
+                'email_verified': False
+            }, status=status.HTTP_400_BAD_REQUEST)
+    
+    def get(self, request):
+        email = request.query_params.get('email')
+        if not email:
+            return Response({'detail': 'Email is required'}, status=status.HTTP_400_BAD_REQUEST)
+        
+        try:
+            user = CustomUser.objects.get(email=email)
+            return Response({
+                'email': user.email,
+                'email_verified': user.email_verified
+            }, status=status.HTTP_200_OK)
+            
+        except CustomUser.DoesNotExist:
+            return Response({'detail': 'User not found'}, status=status.HTTP_404_NOT_FOUND)
 
 class DocumentListCreateView(APIView):
     parser_classes = (MultiPartParser, FormParser)
@@ -69,7 +153,7 @@ class DocumentDetailView(APIView):
 
 class ConversationListCreateView(APIView):
     def get(self, request):
-        convos = Conversation.objects.filter(owner=request.user).order_by('-created_at')
+        convos = Conversation.objects.filter(owner=request.user).order_by('-updated_at')
         return Response(ConversationSerializer(convos, many=True).data)
 
     def post(self, request):
@@ -117,6 +201,11 @@ class MessageCreateView(APIView):
         # synthesize answer
         answer = synthesize_answer(user_text, hits)
         m_assist = Message.objects.create(conversation=convo, role='assistant', content=answer)
+
+        # Update conversation's updated_at field to reflect the new message
+        from django.utils import timezone
+        convo.updated_at = timezone.now()
+        convo.save()
 
         # track sources (first few)
         for h in hits[:5]:
@@ -172,3 +261,193 @@ class ConversationDetailView(APIView):
         convo.title = request.data.get('title','')
         convo.save()
         return Response(ConversationSerializer(convo).data)
+
+class PasswordResetRequestView(APIView):
+    permission_classes = [permissions.AllowAny]
+    
+    def post(self, request):
+        serializer = PasswordResetRequestSerializer(data=request.data)
+        if serializer.is_valid():
+            email = serializer.validated_data['email']
+            
+            try:
+                user = CustomUser.objects.get(email=email)
+                
+                # Create and send password reset email
+                reset_token = create_password_reset_token(user, expires_in_hours=1)
+                email_sent = send_password_reset_email(user, reset_token)
+                
+                if email_sent:
+                    return Response({
+                        'detail': 'Password reset email sent successfully',
+                        'message': 'Please check your email and click the reset link.'
+                    }, status=status.HTTP_200_OK)
+                else:
+                    return Response({
+                        'detail': 'Failed to send password reset email'
+                    }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+                    
+            except CustomUser.DoesNotExist:
+                # Don't reveal if user exists or not for security
+                return Response({
+                    'detail': 'If an account with that email exists, a password reset link has been sent.'
+                }, status=status.HTTP_200_OK)
+        
+        return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+
+class PasswordResetConfirmView(APIView):
+    permission_classes = [permissions.AllowAny]
+    
+    def post(self, request):
+        serializer = PasswordResetConfirmSerializer(data=request.data)
+        if serializer.is_valid():
+            token = serializer.validated_data['token']
+            new_password = serializer.validated_data['new_password']
+            
+            # Verify token
+            success, result = verify_password_reset_token(token)
+            
+            if not success:
+                return Response({
+                    'detail': result
+                }, status=status.HTTP_400_BAD_REQUEST)
+            
+            user = result
+            
+            # Update password
+            user.set_password(new_password)
+            user.save()
+            
+            # Mark token as used
+            use_password_reset_token(token)
+            
+            return Response({
+                'detail': 'Password reset successfully'
+            }, status=status.HTTP_200_OK)
+        
+        return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+
+class ChangePasswordView(APIView):
+    permission_classes = [permissions.IsAuthenticated]
+    
+    def post(self, request):
+        serializer = ChangePasswordSerializer(data=request.data)
+        if serializer.is_valid():
+            old_password = serializer.validated_data['old_password']
+            new_password = serializer.validated_data['new_password']
+            
+            # Verify old password
+            if not request.user.check_password(old_password):
+                return Response({
+                    'detail': 'Current password is incorrect'
+                }, status=status.HTTP_400_BAD_REQUEST)
+            
+            # Update password
+            request.user.set_password(new_password)
+            request.user.save()
+            
+            return Response({
+                'detail': 'Password changed successfully'
+            }, status=status.HTTP_200_OK)
+        
+        return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+
+class UserProfileView(APIView):
+    permission_classes = [permissions.IsAuthenticated]
+    
+    def get(self, request):
+        """Get user profile information"""
+        serializer = UserProfileSerializer(request.user)
+        return Response(serializer.data)
+    
+    def put(self, request):
+        """Update user profile information"""
+        serializer = UserProfileUpdateSerializer(request.user, data=request.data, partial=True)
+        if serializer.is_valid():
+            serializer.save()
+            # Return updated profile
+            profile_serializer = UserProfileSerializer(request.user)
+            return Response(profile_serializer.data)
+        return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+
+class ProfilePictureView(APIView):
+    permission_classes = [permissions.IsAuthenticated]
+    parser_classes = (MultiPartParser, FormParser)
+    
+    def post(self, request):
+        """Upload/Update profile picture"""
+        serializer = ProfilePictureSerializer(request.user, data=request.data)
+        if serializer.is_valid():
+            # Delete old profile picture if exists
+            if request.user.profile_picture:
+                request.user.profile_picture.delete(save=False)
+            
+            serializer.save()
+            
+            # Return updated profile
+            profile_serializer = UserProfileSerializer(request.user)
+            return Response({
+                'detail': 'Profile picture updated successfully',
+                'profile': profile_serializer.data
+            }, status=status.HTTP_200_OK)
+        
+        return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+    
+    def delete(self, request):
+        """Remove profile picture"""
+        if request.user.profile_picture:
+            request.user.profile_picture.delete(save=False)
+            request.user.profile_picture = None
+            request.user.save()
+            
+            profile_serializer = UserProfileSerializer(request.user)
+            return Response({
+                'detail': 'Profile picture removed successfully',
+                'profile': profile_serializer.data
+            }, status=status.HTTP_200_OK)
+        
+        return Response({
+            'detail': 'No profile picture to remove'
+        }, status=status.HTTP_400_BAD_REQUEST)
+
+class UpdateLLMModelView(APIView):
+    permission_classes = [permissions.IsAuthenticated]
+    
+    def get(self, request):
+        """Get user's current LLM model preference"""
+        return Response({
+            'preferred_llm': request.user.preferred_llm,
+            'current_model_details': {
+                'name': request.user.preferred_llm,
+                'display_name': dict(request.user.LLM_CHOICES).get(request.user.preferred_llm, 'Unknown')
+            }
+        })
+    
+    def post(self, request):
+        """Update user's LLM model preference"""
+        preferred_llm = request.data.get('preferred_llm')
+        
+        if not preferred_llm:
+            return Response({
+                'detail': 'preferred_llm is required'
+            }, status=status.HTTP_400_BAD_REQUEST)
+        
+        # Validate the model choice
+        valid_choices = [choice[0] for choice in request.user.LLM_CHOICES]
+        if preferred_llm not in valid_choices:
+            return Response({
+                'detail': f'Invalid model choice. Must be one of: {", ".join(valid_choices)}'
+            }, status=status.HTTP_400_BAD_REQUEST)
+        
+        # Update the user's preference
+        request.user.preferred_llm = preferred_llm
+        request.user.save()
+        
+        return Response({
+            'detail': 'LLM model preference updated successfully',
+            'preferred_llm': request.user.preferred_llm,
+            'current_model_details': {
+                'name': request.user.preferred_llm,
+                'display_name': dict(request.user.LLM_CHOICES).get(request.user.preferred_llm, 'Unknown')
+            }
+        }, status=status.HTTP_200_OK)

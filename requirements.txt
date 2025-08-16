@@ -7,3 +7,4 @@ PyMuPDF==1.26.3
 chromadb>=0.5
 openai>=1.40.0
 tqdm>=4.66.4
+cryptography>=41.0.0
