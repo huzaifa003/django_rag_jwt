@@ -64,18 +64,64 @@ def vision_extract(image_path: str) -> Dict[str, str]:
         print(f'[Vision] OpenAI call failed for {image_path}: {e}', file=sys.stderr)
         return {'extracted_text': '', 'description': ''}
 
-def synthesize_answer(question: str, hits: List[dict]) -> str:
+def synthesize_answer(question: str, hits: List[dict], conversation_history: List[dict] = None) -> str:
     client = get_client()
-    ctx = []
-    for i, h in enumerate(hits, 1):
-        body = h.get('text') or ''
-        meta = f"page={h.get('page','?')} source={h.get('source','')}"
-        ctx.append(f"[{i}] {meta}\n{body}")
-    context = "\n\n".join(ctx) if ctx else "(no context)"
-    messages = [
-        {'role':'system','content':'Answer the user using only the provided context. If unsure, say you do not know. If the user just greet so greet them as well and say that i am a chatbot and i am here to help them. and if user showing his gratitude so you need to be very humble to them you should act as a proper assistant who will think and help them as a human. If the user ask very generic questions so you should sounds like that you acknowledge them and say that you are here to help them and you will think and help them as a human and understand the context of the chat properly and answer according to it'},
-        {'role':'user','content': f"Question:\n{question}\n\nContext:\n{context}\n\nAnswer succinctly."},
-    ]
+    
+    # Build conversation context from history
+    conversation_messages = []
+    if conversation_history:
+        # Add conversation history (limit to last 10 messages to avoid token limits)
+        for msg in conversation_history[-10:]:
+            conversation_messages.append({
+                'role': msg['role'],
+                'content': msg['content']
+            })
+    
+    # Check if this is a generic conversation (no hits provided)
+    if not hits:
+        # For generic conversations, use a more conversational system prompt
+        system_content = (
+            "You are a helpful AI assistant. Respond naturally to greetings, gratitude, and casual conversation. "
+            "Be warm, friendly, and acknowledge the user appropriately. Keep responses concise but engaging. "
+            "Maintain context from the conversation history and refer to previous messages when relevant. "
+            "If the user asks follow-up questions or refers to previous topics, use the conversation history to provide contextual responses."
+        )
+        
+        system_message = {
+            'role': 'system',
+            'content': system_content
+        }
+        
+        messages = [system_message] + conversation_messages + [{'role': 'user', 'content': question}]
+    else:
+        # For document-related queries, use RAG context
+        ctx = []
+        for i, h in enumerate(hits, 1):
+            body = h.get('text') or ''
+            meta = f"page={h.get('page','?')} source={h.get('source','')}"
+            ctx.append(f"[{i}] {meta}\n{body}")
+        context = "\n\n".join(ctx) if ctx else "(no context)"
+        
+        system_content = (
+            "Answer the user using the provided context and conversation history. If unsure, say you do not know. "
+            "If the user just greet so greet them as well and say that i am a chatbot and i am here to help them. "
+            "and if user showing his gratitude so you need to be very humble to them you should act as a proper assistant who will think and help them as a human. "
+            "If the user ask very generic questions so you should sounds like that you acknowledge them and say that you are here to help them and you will think and help them as a human and understand the context of the chat properly and answer according to it. "
+            "For Greetings and simple conversation and gratitude you shouldnt have to return me the sources from the chromadb context. "
+            "Maintain conversation context and refer to previous messages when relevant. "
+            "If the user asks follow-up questions about previously discussed topics, use both the conversation history and the provided context to give comprehensive answers."
+        )
+        
+        system_message = {
+            'role': 'system',
+            'content': system_content
+        }
+        
+        # Combine conversation history with current question and context
+        current_question = f"Question:\n{question}\n\nContext:\n{context}\n\nAnswer succinctly."
+        
+        messages = [system_message] + conversation_messages + [{'role': 'user', 'content': current_question}]
+    
     resp = client.chat.completions.create(
         model=os.getenv('OPENAI_LLM_MODEL', settings.OPENAI_LLM_MODEL),
         messages=messages,
