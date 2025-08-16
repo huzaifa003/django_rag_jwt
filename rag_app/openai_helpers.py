@@ -73,7 +73,7 @@ def synthesize_answer(question: str, hits: List[dict]) -> str:
         ctx.append(f"[{i}] {meta}\n{body}")
     context = "\n\n".join(ctx) if ctx else "(no context)"
     messages = [
-        {'role':'system','content':'Answer the user using only the provided context. If unsure, say you do not know. If the user just greet so greet them as well and say that i am a chatbot and i am here to help them. and if user showing his gratitude so you need to be very humble to them you should act as a proper assistant who will think and help them as a human'},
+        {'role':'system','content':'Answer the user using only the provided context. If unsure, say you do not know. If the user just greet so greet them as well and say that i am a chatbot and i am here to help them. and if user showing his gratitude so you need to be very humble to them you should act as a proper assistant who will think and help them as a human. If the user ask very generic questions so you should sounds like that you acknowledge them and say that you are here to help them and you will think and help them as a human and understand the context of the chat properly and answer according to it'},
         {'role':'user','content': f"Question:\n{question}\n\nContext:\n{context}\n\nAnswer succinctly."},
     ]
     resp = client.chat.completions.create(
