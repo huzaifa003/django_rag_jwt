@@ -3,7 +3,7 @@ from .views import (
     RegisterView, SendVerificationEmailView, VerifyEmailView,
     PasswordResetRequestView, PasswordResetConfirmView, ChangePasswordView,
     UserProfileView, ProfilePictureView, UpdateLLMModelView,
-    DocumentListCreateView, DocumentDetailView,
+    DocumentListCreateView, DocumentDetailView, DocumentFolderIngestView,
     ConversationListCreateView, ConversationDetailView, MessageCreateView,
 )
 from rest_framework.permissions import AllowAny
@@ -21,6 +21,7 @@ urlpatterns = [
     path('profile/picture/', ProfilePictureView.as_view(), name='profile-picture'),
     path('user/update-llm-model/', UpdateLLMModelView.as_view(), name='update-llm-model'),
     path('docs/', DocumentListCreateView.as_view(), name='docs'),
+    path('docs/folder', DocumentFolderIngestView.as_view(), name='doc-folder-ingest'),
     path('docs/<int:pk>/', DocumentDetailView.as_view(), name='doc-detail'),
     path('conversations/', ConversationListCreateView.as_view(), name='conversations'),
     path('conversations/<int:convo_id>/', ConversationDetailView.as_view(), name='conversation-detail'),

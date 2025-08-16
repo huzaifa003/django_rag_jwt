@@ -683,3 +683,55 @@ class UpdateLLMModelView(APIView):
                 'display_name': dict(request.user.LLM_CHOICES).get(request.user.preferred_llm, 'Unknown')
             }
         }, status=status.HTTP_200_OK)
+
+
+class DocumentFolderIngestView(APIView):
+    """
+    Endpoint to ingest all documents from a specific folder.
+    This is useful for bulk ingestion of documents.
+    """
+    permission_classes = [permissions.IsAuthenticated]
+    
+    def post(self, request):
+        folder_path = request.data.get('folder_path')
+        if not folder_path:
+            return Response({'detail': 'folder_path is required'}, status=400)
+        
+        if not os.path.isdir(folder_path):
+            return Response({'detail': 'Invalid folder path'}, status=400)
+        
+        store = ChromaStore()
+        count = 0
+        
+        try:
+            for filename in os.listdir(folder_path):
+                file_path = os.path.join(folder_path, filename)
+                if os.path.isfile(file_path) and filename.lower().endswith('.pdf'):
+                    # Ingest each PDF file
+                    with open(file_path, 'rb') as f:
+                        doc = Document.objects.create(
+                            owner=request.user,
+                            file=f,
+                            original_name=filename,
+                        )
+                        records = extract_pdf_pages_as_images(doc.file.path, out_dir=settings.MEDIA_ROOT, dpi=200, max_pages=None)
+                        chunks = []
+                        for rec in records:
+                            info = vision_extract(rec['image_path'])
+                            text = (info.get('extracted_text') or '').strip()
+                            desc = (info.get('description') or '').strip()
+                            content = text if text else desc
+                            for idx, chunk in enumerate(split_for_embedding(content)):
+                                chunks.append({
+                                    'text': chunk,
+                                    'page': rec['page'],
+                                    'source': rec['source'],
+                                    'image_path': rec['image_path'],
+                                    'chunk': idx,
+                                })
+                        stored = store.upsert_chunks(user_id=request.user.id, document_id=doc.id, chunks=chunks)
+                        count += stored
+        except Exception as e:
+            return Response({'detail': f'Error during ingestion: {str(e)}'}, status=500)
+        
+        return Response({'detail': f'Ingested {count} chunks from {len(os.listdir(folder_path))} files.'}, status=201)
