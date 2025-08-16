@@ -1,21 +1,206 @@
 import os
+from typing import List
 from django.conf import settings
-from django.contrib.auth.models import User
 from rest_framework import generics, permissions, status
 from rest_framework.response import Response
 from rest_framework.views import APIView
 from rest_framework.parsers import MultiPartParser, FormParser
-from .models import Document, Conversation, Message, MessageSource
-from .serializers import RegisterSerializer, DocumentSerializer, ConversationSerializer, MessageSerializer
+from rest_framework_simplejwt.views import TokenObtainPairView
+from .models import CustomUser, Document, Conversation, Message, MessageSource
+from .serializers import (
+    RegisterSerializer, CustomTokenObtainPairSerializer, DocumentSerializer, ConversationSerializer, MessageSerializer,
+    PasswordResetRequestSerializer, PasswordResetConfirmSerializer, ChangePasswordSerializer,
+    UserProfileSerializer, UserProfileUpdateSerializer, ProfilePictureSerializer
+)
 from .extract import extract_pdf_pages_as_images
 from .openai_helpers import vision_extract, synthesize_answer
 from .textutils import split_for_embedding
 from .store import ChromaStore
+from .email_service import (
+    create_verification_token, send_verification_email, verify_email_token,
+    create_password_reset_token, send_password_reset_email, verify_password_reset_token, use_password_reset_token
+)
+
+def is_generic_conversation_query(text: str) -> bool:
+    """
+    Detect if a query is generic/conversational and doesn't need RAG retrieval.
+    """
+    # Convert to lowercase for easier matching
+    text_lower = text.lower().strip()
+    
+    # Common greeting patterns
+    greetings = [
+        'hello', 'hi', 'hey', 'good morning', 'good afternoon', 'good evening',
+        'how are you', 'how do you do', 'nice to meet you', 'pleasure to meet you',
+        'greetings', 'good day', 'good evening', 'good afternoon'
+    ]
+    
+    # Common gratitude patterns
+    gratitude = [
+        'thank you', 'thanks', 'thank you so much', 'thanks a lot', 'appreciate it',
+        'grateful', 'bless you', 'you\'re the best', 'awesome', 'great job',
+        'excellent', 'fantastic', 'wonderful', 'amazing', 'perfect'
+    ]
+    
+    # Common farewell patterns
+    farewells = [
+        'goodbye', 'bye', 'see you', 'see you later', 'take care', 'have a good day',
+        'good night', 'goodbye for now', 'talk to you later', 'farewell',
+        'until next time', 'see you soon', 'take care'
+    ]
+    
+    # Common casual conversation patterns
+    casual = [
+        'how\'s it going', 'what\'s up', 'sup', 'how are things', 'everything ok',
+        'are you ok', 'are you there', 'can you hear me', 'are you working',
+        'how are you doing', 'what\'s new', 'how\'s everything', 'how\'s life'
+    ]
+    
+    # Common acknowledgment patterns
+    acknowledgments = [
+        'ok', 'okay', 'alright', 'sure', 'yes', 'yeah', 'yep', 'got it',
+        'understood', 'i see', 'i understand', 'noted', 'roger'
+    ]
+    
+    # Check if the text matches any of these patterns
+    for pattern in greetings + gratitude + farewells + casual + acknowledgments:
+        if pattern in text_lower:
+            return True
+    
+    # Check for very short queries (likely conversational)
+    if len(text_lower.split()) <= 3:
+        return True
+    
+    # Check for questions that don't seem document-related
+    if any(word in text_lower for word in ['you', 'your', 'yourself']) and len(text_lower.split()) <= 5:
+        return True
+    
+    # Check for single words that are likely conversational
+    single_words = ['ok', 'okay', 'yes', 'no', 'maybe', 'sure', 'alright', 'fine']
+    if text_lower in single_words:
+        return True
+    
+    return False
+
+def get_conversation_context(conversation, max_messages: int = 10, include_current_user_message: bool = False) -> List[dict]:
+    """
+    Get conversation history for context, limiting to recent messages to avoid token limits.
+    
+    Args:
+        conversation: Conversation object
+        max_messages: Maximum number of recent messages to include
+        include_current_user_message: Whether to include the current user message in context
+    
+    Returns:
+        List of message dictionaries with role and content
+    """
+    conversation_history = []
+    previous_messages = conversation.messages.order_by('created_at')
+    
+    # If we don't want to include the current user message, exclude it
+    if not include_current_user_message:
+        previous_messages = previous_messages.exclude(role='user').order_by('created_at')
+    
+    # Get the last max_messages messages using Django's slice method
+    # First, get the total count to calculate the offset
+    total_count = previous_messages.count()
+    if total_count > max_messages:
+        # Get messages from the end (total_count - max_messages) to the end
+        offset = total_count - max_messages
+        recent_messages = previous_messages[offset:]
+    else:
+        # If we have fewer messages than max_messages, get all of them
+        recent_messages = previous_messages
+    
+    # Convert to list of dictionaries
+    for msg in recent_messages:
+        conversation_history.append({
+            'role': msg.role,
+            'content': msg.content
+        })
+    
+    return conversation_history
+
+class CustomTokenObtainPairView(TokenObtainPairView):
+    serializer_class = CustomTokenObtainPairSerializer
 
 class RegisterView(generics.CreateAPIView):
-    queryset = User.objects.all()
+    queryset = CustomUser.objects.all()
     serializer_class = RegisterSerializer
     permission_classes = [permissions.AllowAny]
+    
+    def perform_create(self, serializer):
+        user = serializer.save()
+        # Create and send verification email
+        verification_token = create_verification_token(user)
+        send_verification_email(user, verification_token)
+
+class SendVerificationEmailView(APIView):
+    permission_classes = [permissions.AllowAny]
+    
+    def post(self, request):
+        email = request.data.get('email')
+        if not email:
+            return Response({'detail': 'Email is required'}, status=status.HTTP_400_BAD_REQUEST)
+        
+        try:
+            user = CustomUser.objects.get(email=email)
+            
+            if user.email_verified:
+                return Response({'detail': 'Email is already verified'}, status=status.HTTP_400_BAD_REQUEST)
+            
+            # Create and send new verification email
+            verification_token = create_verification_token(user)
+            email_sent = send_verification_email(user, verification_token)
+            
+            if email_sent:
+                return Response({
+                    'detail': 'Verification email sent successfully',
+                    'message': 'Please check your email and click the verification link.'
+                }, status=status.HTTP_200_OK)
+            else:
+                return Response({
+                    'detail': 'Failed to send verification email'
+                }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+                
+        except CustomUser.DoesNotExist:
+            return Response({'detail': 'User not found'}, status=status.HTTP_404_NOT_FOUND)
+
+class VerifyEmailView(APIView):
+    permission_classes = [permissions.AllowAny]
+    
+    def post(self, request):
+        token = request.data.get('token')
+        if not token:
+            return Response({'detail': 'Token is required'}, status=status.HTTP_400_BAD_REQUEST)
+        
+        success, message = verify_email_token(token)
+        
+        if success:
+            return Response({
+                'detail': message,
+                'email_verified': True
+            }, status=status.HTTP_200_OK)
+        else:
+            return Response({
+                'detail': message,
+                'email_verified': False
+            }, status=status.HTTP_400_BAD_REQUEST)
+    
+    def get(self, request):
+        email = request.query_params.get('email')
+        if not email:
+            return Response({'detail': 'Email is required'}, status=status.HTTP_400_BAD_REQUEST)
+        
+        try:
+            user = CustomUser.objects.get(email=email)
+            return Response({
+                'email': user.email,
+                'email_verified': user.email_verified
+            }, status=status.HTTP_200_OK)
+            
+        except CustomUser.DoesNotExist:
+            return Response({'detail': 'User not found'}, status=status.HTTP_404_NOT_FOUND)
 
 class DocumentListCreateView(APIView):
     parser_classes = (MultiPartParser, FormParser)
@@ -69,7 +254,7 @@ class DocumentDetailView(APIView):
 
 class ConversationListCreateView(APIView):
     def get(self, request):
-        convos = Conversation.objects.filter(owner=request.user).order_by('-created_at')
+        convos = Conversation.objects.filter(owner=request.user).order_by('-updated_at')
         return Response(ConversationSerializer(convos, many=True).data)
 
     def post(self, request):
@@ -110,36 +295,172 @@ class MessageCreateView(APIView):
         # store user msg
         m_user = Message.objects.create(conversation=convo, role='user', content=user_text)
 
-        # retrieve
-        store = ChromaStore()
-        hits = store.query(user_id=request.user.id, text=user_text, top_k=int(request.data.get('top_k',8)), document_ids=doc_ids)
+        # Get conversation history for context (excluding current user message to avoid duplication)
+        # Adjust context window based on conversation length
+        total_messages = convo.messages.count()
+        if total_messages > 20:
+            max_context = 8  # Shorter context for long conversations
+        elif total_messages > 10:
+            max_context = 10  # Medium context
+        else:
+            max_context = 12  # Full context for short conversations
+            
+        conversation_history = get_conversation_context(convo, max_messages=max_context, include_current_user_message=False)
+        
+        # Check if this is a generic conversation query
+        is_generic = is_generic_conversation_query(user_text)
+        
+        if is_generic:
+            # For generic queries, skip RAG retrieval and use conversational response
+            answer = synthesize_answer(user_text, [], conversation_history)
+            m_assist = Message.objects.create(conversation=convo, role='assistant', content=answer)
+            
+            # Update conversation's updated_at field to reflect the new message
+            from django.utils import timezone
+            convo.updated_at = timezone.now()
+            convo.save()
+            
+            return Response({
+                'assistant': MessageSerializer(m_assist).data,
+                'retrieved': [],
+                'is_generic_conversation': True,
+            }, status=201)
+        else:
+            # For document-related queries, use RAG retrieval
+            store = ChromaStore()
+            hits = store.query(user_id=request.user.id, text=user_text, top_k=int(request.data.get('top_k',8)), document_ids=doc_ids)
 
-        # synthesize answer
-        answer = synthesize_answer(user_text, hits)
-        m_assist = Message.objects.create(conversation=convo, role='assistant', content=answer)
+            # synthesize answer with conversation history
+            answer = synthesize_answer(user_text, hits, conversation_history)
+            m_assist = Message.objects.create(conversation=convo, role='assistant', content=answer)
 
-        # track sources (first few)
-        for h in hits[:5]:
-            # Best-effort mapping to Document by filename
-            doc = None
-            try:
-                src_name = os.path.basename(str(h.get('source','')))
-                doc = Document.objects.filter(owner=request.user, original_name__icontains=src_name).first()
-            except Exception:
+            # Update conversation's updated_at field to reflect the new message
+            from django.utils import timezone
+            convo.updated_at = timezone.now()
+            convo.save()
+
+            # track sources (first few)
+            for h in hits[:5]:
+                # Best-effort mapping to Document by filename
                 doc = None
-            MessageSource.objects.create(
-                message=m_assist,
-                document=doc,
-                page=h.get('page',0),
-                snippet=(h.get('text') or '')[:500],
-                image_path=h.get('image_path',''),
-                source=h.get('source',''),
+                try:
+                    src_name = os.path.basename(str(h.get('source','')))
+                    doc = Document.objects.filter(owner=request.user, original_name__icontains=src_name).first()
+                except Exception:
+                    doc = None
+                MessageSource.objects.create(
+                    message=m_assist,
+                    document=doc,
+                    page=h.get('page',0),
+                    snippet=(h.get('text') or '')[:500],
+                    image_path=h.get('image_path',''),
+                    source=h.get('source',''),
+                )
+
+            return Response({
+                'assistant': MessageSerializer(m_assist).data,
+                'retrieved': hits,
+                'is_generic_conversation': False,
+            }, status=201)
+
+class DocumentQuestionView(APIView):
+    def post(self, request, convo_id, doc_id):
+        """
+        Ask a specific question about a document within a conversation.
+        This endpoint allows users to ask questions about a specific document
+        while maintaining conversation context.
+        """
+        try:
+            convo = Conversation.objects.get(pk=convo_id, owner=request.user)
+        except Conversation.DoesNotExist:
+            return Response({'detail': 'Conversation not found'}, status=404)
+
+        try:
+            doc = Document.objects.get(pk=doc_id, owner=request.user)
+        except Document.DoesNotExist:
+            return Response({'detail': 'Document not found'}, status=404)
+
+        user_text = request.data.get('message', '').strip()
+        if not user_text:
+            return Response({'detail': 'message required'}, status=400)
+
+        # store user msg
+        m_user = Message.objects.create(conversation=convo, role='user', content=user_text)
+
+        # Get conversation history for context
+        # Adjust context window based on conversation length
+        total_messages = convo.messages.count()
+        if total_messages > 20:
+            max_context = 8  # Shorter context for long conversations
+        elif total_messages > 10:
+            max_context = 10  # Medium context
+        else:
+            max_context = 12  # Full context for short conversations
+            
+        conversation_history = get_conversation_context(convo, max_messages=max_context, include_current_user_message=False)
+
+        # Check if this is a generic conversation query
+        is_generic = is_generic_conversation_query(user_text)
+        
+        if is_generic:
+            # For generic queries, skip RAG retrieval and use conversational response
+            answer = synthesize_answer(user_text, [], conversation_history)
+            m_assist = Message.objects.create(conversation=convo, role='assistant', content=answer)
+            
+            # Update conversation's updated_at field to reflect the new message
+            from django.utils import timezone
+            convo.updated_at = timezone.now()
+            convo.save()
+            
+            return Response({
+                'assistant': MessageSerializer(m_assist).data,
+                'retrieved': [],
+                'is_generic_conversation': True,
+                'document_id': doc_id,
+            }, status=201)
+        else:
+            # For document-related queries, use RAG retrieval on the specific document
+            store = ChromaStore()
+            hits = store.query(
+                user_id=request.user.id, 
+                text=user_text, 
+                top_k=int(request.data.get('top_k', 8)), 
+                document_ids=[doc_id]
             )
 
-        return Response({
-            'assistant': MessageSerializer(m_assist).data,
-            'retrieved': hits,
-        }, status=201)
+            # synthesize answer with conversation history
+            answer = synthesize_answer(user_text, hits, conversation_history)
+            m_assist = Message.objects.create(conversation=convo, role='assistant', content=answer)
+
+            # Update conversation's updated_at field to reflect the new message
+            from django.utils import timezone
+            convo.updated_at = timezone.now()
+            convo.save()
+
+            # track sources (first few)
+            for h in hits[:5]:
+                # Best-effort mapping to Document by filename
+                doc_source = None
+                try:
+                    src_name = os.path.basename(str(h.get('source','')))
+                    doc_source = Document.objects.filter(owner=request.user, original_name__icontains=src_name).first()
+                except Exception:
+                    doc_source = None
+                MessageSource.objects.create(
+                    message=m_assist,
+                    document=doc_source or doc,  # Use the specific document if mapping fails
+                    page=h.get('page',0),
+                    snippet=(h.get('text') or '')[:500],
+                    image_path=h.get('image_path',''),
+                    source=h.get('source',''),
+                )
+
+            return Response({
+                'assistant': MessageSerializer(m_assist).data,
+                'retrieved': hits,
+                'is_generic_conversation': False,
+                'document_id': doc_id,
+            }, status=201)
 
 class ConversationDetailView(APIView):
     def get(self, request, convo_id):
@@ -172,3 +493,193 @@ class ConversationDetailView(APIView):
         convo.title = request.data.get('title','')
         convo.save()
         return Response(ConversationSerializer(convo).data)
+
+class PasswordResetRequestView(APIView):
+    permission_classes = [permissions.AllowAny]
+    
+    def post(self, request):
+        serializer = PasswordResetRequestSerializer(data=request.data)
+        if serializer.is_valid():
+            email = serializer.validated_data['email']
+            
+            try:
+                user = CustomUser.objects.get(email=email)
+                
+                # Create and send password reset email
+                reset_token = create_password_reset_token(user, expires_in_hours=1)
+                email_sent = send_password_reset_email(user, reset_token)
+                
+                if email_sent:
+                    return Response({
+                        'detail': 'Password reset email sent successfully',
+                        'message': 'Please check your email and click the reset link.'
+                    }, status=status.HTTP_200_OK)
+                else:
+                    return Response({
+                        'detail': 'Failed to send password reset email'
+                    }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+                    
+            except CustomUser.DoesNotExist:
+                # Don't reveal if user exists or not for security
+                return Response({
+                    'detail': 'If an account with that email exists, a password reset link has been sent.'
+                }, status=status.HTTP_200_OK)
+        
+        return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+
+class PasswordResetConfirmView(APIView):
+    permission_classes = [permissions.AllowAny]
+    
+    def post(self, request):
+        serializer = PasswordResetConfirmSerializer(data=request.data)
+        if serializer.is_valid():
+            token = serializer.validated_data['token']
+            new_password = serializer.validated_data['new_password']
+            
+            # Verify token
+            success, result = verify_password_reset_token(token)
+            
+            if not success:
+                return Response({
+                    'detail': result
+                }, status=status.HTTP_400_BAD_REQUEST)
+            
+            user = result
+            
+            # Update password
+            user.set_password(new_password)
+            user.save()
+            
+            # Mark token as used
+            use_password_reset_token(token)
+            
+            return Response({
+                'detail': 'Password reset successfully'
+            }, status=status.HTTP_200_OK)
+        
+        return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+
+class ChangePasswordView(APIView):
+    permission_classes = [permissions.IsAuthenticated]
+    
+    def post(self, request):
+        serializer = ChangePasswordSerializer(data=request.data)
+        if serializer.is_valid():
+            old_password = serializer.validated_data['old_password']
+            new_password = serializer.validated_data['new_password']
+            
+            # Verify old password
+            if not request.user.check_password(old_password):
+                return Response({
+                    'detail': 'Current password is incorrect'
+                }, status=status.HTTP_400_BAD_REQUEST)
+            
+            # Update password
+            request.user.set_password(new_password)
+            request.user.save()
+            
+            return Response({
+                'detail': 'Password changed successfully'
+            }, status=status.HTTP_200_OK)
+        
+        return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+
+class UserProfileView(APIView):
+    permission_classes = [permissions.IsAuthenticated]
+    
+    def get(self, request):
+        """Get user profile information"""
+        serializer = UserProfileSerializer(request.user)
+        return Response(serializer.data)
+    
+    def put(self, request):
+        """Update user profile information"""
+        serializer = UserProfileUpdateSerializer(request.user, data=request.data, partial=True)
+        if serializer.is_valid():
+            serializer.save()
+            # Return updated profile
+            profile_serializer = UserProfileSerializer(request.user)
+            return Response(profile_serializer.data)
+        return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+
+class ProfilePictureView(APIView):
+    permission_classes = [permissions.IsAuthenticated]
+    parser_classes = (MultiPartParser, FormParser)
+    
+    def post(self, request):
+        """Upload/Update profile picture"""
+        serializer = ProfilePictureSerializer(request.user, data=request.data)
+        if serializer.is_valid():
+            # Delete old profile picture if exists
+            if request.user.profile_picture:
+                request.user.profile_picture.delete(save=False)
+            
+            serializer.save()
+            
+            # Return updated profile
+            profile_serializer = UserProfileSerializer(request.user)
+            return Response({
+                'detail': 'Profile picture updated successfully',
+                'profile': profile_serializer.data
+            }, status=status.HTTP_200_OK)
+        
+        return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+    
+    def delete(self, request):
+        """Remove profile picture"""
+        if request.user.profile_picture:
+            request.user.profile_picture.delete(save=False)
+            request.user.profile_picture = None
+            request.user.save()
+            
+            profile_serializer = UserProfileSerializer(request.user)
+            return Response({
+                'detail': 'Profile picture removed successfully',
+                'profile': profile_serializer.data
+            }, status=status.HTTP_200_OK)
+        
+        return Response({
+            'detail': 'No profile picture to remove'
+        }, status=status.HTTP_400_BAD_REQUEST)
+
+class UpdateLLMModelView(APIView):
+    permission_classes = [permissions.IsAuthenticated]
+    
+    def get(self, request):
+        """Get user's current LLM model preference"""
+        return Response({
+            'preferred_llm': request.user.preferred_llm,
+            'current_model_details': {
+                'name': request.user.preferred_llm,
+                'display_name': dict(request.user.LLM_CHOICES).get(request.user.preferred_llm, 'Unknown')
+            }
+        })
+    
+    def post(self, request):
+        """Update user's LLM model preference"""
+        preferred_llm = request.data.get('preferred_llm')
+        
+        if not preferred_llm:
+            return Response({
+                'detail': 'preferred_llm is required'
+            }, status=status.HTTP_400_BAD_REQUEST)
+        
+        # Validate the model choice
+        valid_choices = [choice[0] for choice in request.user.LLM_CHOICES]
+        if preferred_llm not in valid_choices:
+            return Response({
+                'detail': f'Invalid model choice. Must be one of: {", ".join(valid_choices)}'
+            }, status=status.HTTP_400_BAD_REQUEST)
+        
+        # Update the user's preference
+        request.user.preferred_llm = preferred_llm
+        request.user.save()
+        
+        return Response({
+            'detail': 'LLM model preference updated successfully',
+            'preferred_llm': request.user.preferred_llm,
+            'current_model_details': {
+                'name': request.user.preferred_llm,
+                'display_name': dict(request.user.LLM_CHOICES).get(request.user.preferred_llm, 'Unknown')
+            }
+        }, status=status.HTTP_200_OK)
